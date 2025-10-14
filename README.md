@@ -36,6 +36,13 @@ sudo mv ssh-dashboard /usr/local/bin/
 
 ### From Source
 
+#### AUR
+```bash
+yay -S ssh-dashboard-git
+```
+
+#### Manual
+
 ```bash
 git clone https://github.com/AlpinDale/ssh-dashboard.git
 cd ssh-dashboard
