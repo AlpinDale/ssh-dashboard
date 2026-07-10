@@ -136,7 +136,18 @@ Host gpu-server
     HostName gpu.example.com
     User admin
     IdentityFile ~/.ssh/id_ed25519  # optional
+
+Host jump-server
+    HostName jump.example.com
+    User jump-user
+
+Host internal-server
+    HostName 10.0.0.20
+    User admin
+    ProxyJump jump-server  # optional; comma-separated chains are supported
 ```
+
+Hosts configured with `ProxyJump` are reached through the specified jump server using its resolved address, user, port, authentication, and known-host verification.
 
 ### SSH Agent
 

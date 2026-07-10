@@ -2,6 +2,7 @@ package internal
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"math"
 	"net"
@@ -29,11 +30,14 @@ type SSHHost struct {
 	User         string
 	Port         string
 	IdentityFile string
+	ProxyJump    string
+	configPath   string
 }
 
 type SSHClient struct {
-	client *ssh.Client
-	config *SSHHost
+	client      *ssh.Client
+	config      *SSHHost
+	jumpClients []*ssh.Client
 }
 
 func ParseSSHConfig(configPath string) ([]SSHHost, error) {
@@ -46,7 +50,16 @@ func ParseSSHConfig(configPath string) ([]SSHHost, error) {
 	}
 
 	visited := make(map[string]bool)
-	return parseSSHConfigRecursive(configPath, visited)
+	hosts, err := parseSSHConfigRecursive(configPath, visited)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range hosts {
+		hosts[i].configPath = configPath
+	}
+
+	return hosts, nil
 }
 
 func parseSSHConfigRecursive(configPath string, visited map[string]bool) ([]SSHHost, error) {
@@ -109,9 +122,7 @@ func parseSSHConfigRecursive(configPath string, visited map[string]bool) ([]SSHH
 		}
 
 		if key == "host" {
-			if currentHost != nil && !strings.Contains(currentHost.Name, "*") && !strings.Contains(currentHost.Name, "?") {
-				hosts = append(hosts, *currentHost)
-			}
+			hosts = appendConcreteSSHHosts(hosts, currentHost)
 
 			currentHost = &SSHHost{
 				Name: value,
@@ -127,19 +138,36 @@ func parseSSHConfigRecursive(configPath string, visited map[string]bool) ([]SSHH
 				currentHost.Port = value
 			case "identityfile":
 				currentHost.IdentityFile = expandPath(value)
+			case "proxyjump":
+				currentHost.ProxyJump = value
 			}
 		}
 	}
 
-	if currentHost != nil && !strings.Contains(currentHost.Name, "*") && !strings.Contains(currentHost.Name, "?") {
-		hosts = append(hosts, *currentHost)
-	}
+	hosts = appendConcreteSSHHosts(hosts, currentHost)
 
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 
 	return hosts, nil
+}
+
+func appendConcreteSSHHosts(hosts []SSHHost, host *SSHHost) []SSHHost {
+	if host == nil {
+		return hosts
+	}
+
+	for _, name := range strings.Fields(host.Name) {
+		if strings.HasPrefix(name, "!") || strings.ContainsAny(name, "*?") {
+			continue
+		}
+		configuredHost := *host
+		configuredHost.Name = name
+		hosts = append(hosts, configuredHost)
+	}
+
+	return hosts
 }
 
 func expandPath(path string) string {
@@ -317,34 +345,61 @@ func getSSHTimeout() time.Duration {
 }
 
 func dialSSH(addr string, config *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
-	deadline := time.Now().Add(timeout)
-	dialer := net.Dialer{Deadline: deadline}
+	return dialSSHWithDeadline(addr, config, nil, time.Now().Add(timeout))
+}
 
-	conn, err := dialer.Dial("tcp", addr)
+func dialSSHWithDeadline(addr string, config *ssh.ClientConfig, proxy *ssh.Client, deadline time.Time) (*ssh.Client, error) {
+	if time.Until(deadline) <= 0 {
+		return nil, context.DeadlineExceeded
+	}
+
+	var conn net.Conn
+	var err error
+	if proxy == nil {
+		dialer := net.Dialer{Deadline: deadline}
+		conn, err = dialer.Dial("tcp", addr)
+	} else {
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		conn, err = proxy.DialContext(ctx, "tcp", addr)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	if err := conn.SetDeadline(deadline); err != nil {
-		conn.Close()
-		return nil, err
+	deadlineSet := conn.SetDeadline(deadline) == nil
+	var deadlineTimer *time.Timer
+	if !deadlineSet {
+		deadlineTimer = time.AfterFunc(time.Until(deadline), func() {
+			conn.Close()
+		})
 	}
 
 	clientConn, channels, requests, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
+		if deadlineTimer != nil {
+			deadlineTimer.Stop()
+		}
 		conn.Close()
 		return nil, err
 	}
 
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		clientConn.Close()
-		return nil, err
+	if deadlineTimer != nil {
+		if !deadlineTimer.Stop() {
+			clientConn.Close()
+			return nil, context.DeadlineExceeded
+		}
+	} else {
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			clientConn.Close()
+			return nil, err
+		}
 	}
 
 	return ssh.NewClient(clientConn, channels, requests), nil
 }
 
-func NewSSHClient(host SSHHost) (*SSHClient, error) {
+func normalizeSSHHost(host SSHHost) SSHHost {
 	if host.Hostname == "" {
 		host.Hostname = host.Name
 	}
@@ -354,19 +409,26 @@ func NewSSHClient(host SSHHost) (*SSHClient, error) {
 	if host.Port == "" {
 		host.Port = "22"
 	}
+	return host
+}
 
-	var authMethods []ssh.AuthMethod
+func newSSHClientConfig(host SSHHost, timeout time.Duration) (*ssh.ClientConfig, func(), error) {
+	host = normalizeSSHHost(host)
+
+	var signers []ssh.Signer
+	var agentConn net.Conn
 
 	// First, try the specific identity file from SSH config (highest priority)
 	if host.IdentityFile != "" {
-		if keyAuth, err := publicKeyAuth(host.IdentityFile); err == nil {
-			authMethods = append(authMethods, keyAuth)
+		if signer, err := publicKeySigner(host.IdentityFile); err == nil {
+			signers = append(signers, signer)
 		}
 	}
 
 	// Second, try SSH agent (if available)
-	if agentAuth, agentErr := sshAgentAuth(); agentErr == nil {
-		authMethods = append(authMethods, agentAuth)
+	if agentSigners, conn, agentErr := sshAgentSigners(); agentErr == nil {
+		signers = append(signers, agentSigners...)
+		agentConn = conn
 	}
 
 	// Finally, try default key files as fallback
@@ -380,43 +442,246 @@ func NewSSHClient(host SSHHost) (*SSHClient, error) {
 		for _, keyPath := range defaultKeys {
 			// Skip if this is the same as the identity file we already tried
 			if keyPath != host.IdentityFile {
-				if keyAuth, err := publicKeyAuth(keyPath); err == nil {
-					authMethods = append(authMethods, keyAuth)
+				if signer, err := publicKeySigner(keyPath); err == nil {
+					signers = append(signers, signer)
 				}
 			}
 		}
 	}
 
-	if len(authMethods) == 0 {
-		return nil, fmt.Errorf("no authentication methods available")
+	signers = uniqueSSHSigners(signers)
+	if len(signers) == 0 {
+		if agentConn != nil {
+			agentConn.Close()
+		}
+		return nil, nil, fmt.Errorf("no authentication methods available for %s", host.Name)
 	}
 
 	hostKeyCallback, err := getHostKeyCallback()
 	if err != nil {
-		return nil, fmt.Errorf("failed to setup host key verification: %w", err)
+		if agentConn != nil {
+			agentConn.Close()
+		}
+		return nil, nil, fmt.Errorf("failed to setup host key verification: %w", err)
 	}
 
-	timeout := getSSHTimeout()
-	config := &ssh.ClientConfig{
+	closeAuth := func() {
+		if agentConn != nil {
+			agentConn.Close()
+		}
+	}
+
+	return &ssh.ClientConfig{
 		User:            host.User,
-		Auth:            authMethods,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signers...)},
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         timeout,
+	}, closeAuth, nil
+}
+
+func uniqueSSHSigners(signers []ssh.Signer) []ssh.Signer {
+	seen := make(map[string]bool, len(signers))
+	unique := make([]ssh.Signer, 0, len(signers))
+	for _, signer := range signers {
+		fingerprint := ssh.FingerprintSHA256(signer.PublicKey())
+		if seen[fingerprint] {
+			continue
+		}
+		seen[fingerprint] = true
+		unique = append(unique, signer)
+	}
+	return unique
+}
+
+func sshAddress(host SSHHost) string {
+	return net.JoinHostPort(strings.Trim(host.Hostname, "[]"), host.Port)
+}
+
+func connectSSHHost(host SSHHost, proxy *ssh.Client, deadline time.Time) (*ssh.Client, error) {
+	host = normalizeSSHHost(host)
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil, context.DeadlineExceeded
 	}
 
-	addr := fmt.Sprintf("%s:%s", host.Hostname, host.Port)
-	client, err := dialSSH(addr, config, timeout)
+	config, closeAuth, err := newSSHClientConfig(host, remaining)
+	if err != nil {
+		return nil, err
+	}
+	defer closeAuth()
+
+	addr := sshAddress(host)
+	client, err := dialSSHWithDeadline(addr, config, proxy, deadline)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
 
+	return client, nil
+}
+
+func parseProxyJumpSpec(spec string) (name, user, port string, err error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return "", "", "", fmt.Errorf("empty ProxyJump host")
+	}
+
+	if at := strings.LastIndex(spec, "@"); at >= 0 {
+		user = spec[:at]
+		spec = spec[at+1:]
+		if user == "" || spec == "" {
+			return "", "", "", fmt.Errorf("invalid ProxyJump host")
+		}
+	}
+
+	if strings.HasPrefix(spec, "[") {
+		end := strings.Index(spec, "]")
+		if end < 0 {
+			return "", "", "", fmt.Errorf("invalid bracketed ProxyJump host")
+		}
+		name = spec[1:end]
+		remainder := spec[end+1:]
+		if remainder != "" {
+			if !strings.HasPrefix(remainder, ":") || len(remainder) == 1 {
+				return "", "", "", fmt.Errorf("invalid ProxyJump port")
+			}
+			port = remainder[1:]
+		}
+	} else if strings.Count(spec, ":") == 1 {
+		name, port, _ = strings.Cut(spec, ":")
+	} else {
+		name = spec
+	}
+
+	if name == "" {
+		return "", "", "", fmt.Errorf("empty ProxyJump host")
+	}
+	if port != "" {
+		value, parseErr := strconv.ParseUint(port, 10, 16)
+		if parseErr != nil || value == 0 {
+			return "", "", "", fmt.Errorf("invalid ProxyJump port %q", port)
+		}
+	}
+
+	return name, user, port, nil
+}
+
+func resolveProxyJumpHost(spec string, aliases map[string]SSHHost) (SSHHost, error) {
+	name, user, port, err := parseProxyJumpSpec(spec)
+	if err != nil {
+		return SSHHost{}, err
+	}
+
+	host, found := aliases[name]
+	if !found {
+		host = SSHHost{Name: name, Hostname: name, Port: "22"}
+	}
+	if user != "" {
+		host.User = user
+	}
+	if port != "" {
+		host.Port = port
+	}
+
+	return normalizeSSHHost(host), nil
+}
+
+func resolveProxyJumpChain(proxyJump string, aliases map[string]SSHHost, visiting, added map[string]bool) ([]SSHHost, error) {
+	if proxyJump == "" || strings.EqualFold(strings.TrimSpace(proxyJump), "none") {
+		return nil, nil
+	}
+
+	var chain []SSHHost
+	for _, spec := range strings.Split(proxyJump, ",") {
+		jumpHost, err := resolveProxyJumpHost(spec, aliases)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ProxyJump %q: %w", spec, err)
+		}
+
+		key := jumpHost.Name
+		if visiting[key] {
+			return nil, fmt.Errorf("ProxyJump cycle involving %s", key)
+		}
+		if added[key] {
+			continue
+		}
+
+		visiting[key] = true
+		nested, err := resolveProxyJumpChain(jumpHost.ProxyJump, aliases, visiting, added)
+		delete(visiting, key)
+		if err != nil {
+			return nil, err
+		}
+
+		chain = append(chain, nested...)
+		chain = append(chain, jumpHost)
+		added[key] = true
+	}
+
+	return chain, nil
+}
+
+func proxyJumpHosts(host SSHHost) ([]SSHHost, error) {
+	if host.ProxyJump == "" || strings.EqualFold(strings.TrimSpace(host.ProxyJump), "none") {
+		return nil, nil
+	}
+
+	configPath := host.configPath
+	hosts, err := ParseSSHConfig(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve ProxyJump hosts: %w", err)
+	}
+
+	aliases := make(map[string]SSHHost, len(hosts))
+	for _, configuredHost := range hosts {
+		aliases[configuredHost.Name] = configuredHost
+	}
+
+	visiting := map[string]bool{host.Name: true}
+	return resolveProxyJumpChain(host.ProxyJump, aliases, visiting, make(map[string]bool))
+}
+
+func closeSSHClients(clients []*ssh.Client) {
+	for i := len(clients) - 1; i >= 0; i-- {
+		clients[i].Close()
+	}
+}
+
+func NewSSHClient(host SSHHost) (*SSHClient, error) {
+	host = normalizeSSHHost(host)
+	timeout := getSSHTimeout()
+	deadline := time.Now().Add(timeout)
+
+	jumpHosts, err := proxyJumpHosts(host)
+	if err != nil {
+		return nil, err
+	}
+
+	var jumpClients []*ssh.Client
+	var proxy *ssh.Client
+	for _, jumpHost := range jumpHosts {
+		jumpClient, err := connectSSHHost(jumpHost, proxy, deadline)
+		if err != nil {
+			closeSSHClients(jumpClients)
+			return nil, fmt.Errorf("failed to connect through jump host %s: %w", jumpHost.Name, err)
+		}
+		jumpClients = append(jumpClients, jumpClient)
+		proxy = jumpClient
+	}
+
+	client, err := connectSSHHost(host, proxy, deadline)
+	if err != nil {
+		closeSSHClients(jumpClients)
+		return nil, err
+	}
+
 	return &SSHClient{
-		client: client,
-		config: &host,
+		client:      client,
+		config:      &host,
+		jumpClients: jumpClients,
 	}, nil
 }
 
-func publicKeyAuth(keyPath string) (ssh.AuthMethod, error) {
+func publicKeySigner(keyPath string) (ssh.Signer, error) {
 	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, err
@@ -429,23 +694,28 @@ func publicKeyAuth(keyPath string) (ssh.AuthMethod, error) {
 		return nil, err
 	}
 
-	return ssh.PublicKeys(signer), nil
+	return signer, nil
 }
 
-func sshAgentAuth() (ssh.AuthMethod, error) {
+func sshAgentSigners() ([]ssh.Signer, net.Conn, error) {
 	socket := getValidatedSSHAuthSock()
 	if socket == "" {
-		return nil, fmt.Errorf("SSH_AUTH_SOCK not set or invalid")
+		return nil, nil, fmt.Errorf("SSH_AUTH_SOCK not set or invalid")
 	}
 
 	conn, err := net.Dial("unix", socket)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to SSH agent: %w", err)
+		return nil, nil, fmt.Errorf("failed to connect to SSH agent: %w", err)
 	}
 
 	agentClient := agent.NewClient(conn)
+	signers, err := agentClient.Signers()
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("failed to list SSH agent identities: %w", err)
+	}
 
-	return ssh.PublicKeysCallback(agentClient.Signers), nil
+	return signers, conn, nil
 }
 
 func isAllowedCommand(cmd string) bool {
@@ -490,8 +760,10 @@ func (c *SSHClient) ExecuteCommand(cmd string) (string, error) {
 }
 
 func (c *SSHClient) Close() error {
+	var err error
 	if c.client != nil {
-		return c.client.Close()
+		err = c.client.Close()
 	}
-	return nil
+	closeSSHClients(c.jumpClients)
+	return err
 }
