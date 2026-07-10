@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -18,10 +19,12 @@ import (
 )
 
 const (
-	sshTimeoutEnv     = "SSH_DASHBOARD_TIMEOUT"
-	defaultSSHTimeout = 10 * time.Second
-	minSSHTimeout     = 10 * time.Millisecond
-	maxSSHTimeout     = time.Hour
+	sshTimeoutEnv              = "SSH_DASHBOARD_TIMEOUT"
+	defaultSSHTimeout          = 10 * time.Second
+	minSSHTimeout              = 10 * time.Millisecond
+	maxSSHTimeout              = time.Hour
+	maxProxyTargetDialAttempts = 3
+	proxyTargetRetryDelay      = 200 * time.Millisecond
 )
 
 type SSHHost struct {
@@ -35,9 +38,30 @@ type SSHHost struct {
 }
 
 type SSHClient struct {
-	client      *ssh.Client
-	config      *SSHHost
-	jumpClients []*ssh.Client
+	client           *ssh.Client
+	config           *SSHHost
+	releaseJumpChain func()
+	closeOnce        sync.Once
+	closeErr         error
+}
+
+type sharedJumpChain struct {
+	ready    chan struct{}
+	clients  []*ssh.Client
+	err      error
+	refs     int
+	complete bool
+}
+
+type SSHConnector struct {
+	mu         sync.Mutex
+	jumpChains map[string]*sharedJumpChain
+}
+
+var defaultSSHConnector = NewSSHConnector()
+
+func NewSSHConnector() *SSHConnector {
+	return &SSHConnector{jumpChains: make(map[string]*sharedJumpChain)}
 }
 
 func ParseSSHConfig(configPath string) ([]SSHHost, error) {
@@ -399,6 +423,35 @@ func dialSSHWithDeadline(addr string, config *ssh.ClientConfig, proxy *ssh.Clien
 	return ssh.NewClient(clientConn, channels, requests), nil
 }
 
+func dialSSHWithRetry(addr string, config *ssh.ClientConfig, proxy *ssh.Client, deadline time.Time) (*ssh.Client, error) {
+	attempts := 1
+	if proxy != nil {
+		attempts = maxProxyTargetDialAttempts
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		client, err := dialSSHWithDeadline(addr, config, proxy, deadline)
+		if err == nil {
+			return client, nil
+		}
+		lastErr = err
+
+		if attempt == attempts {
+			break
+		}
+		remaining := time.Until(deadline)
+		delay := time.Duration(attempt) * proxyTargetRetryDelay
+		if remaining <= delay {
+			break
+		}
+		timer := time.NewTimer(delay)
+		<-timer.C
+	}
+
+	return nil, lastErr
+}
+
 func normalizeSSHHost(host SSHHost) SSHHost {
 	if host.Hostname == "" {
 		host.Hostname = host.Name
@@ -511,7 +564,7 @@ func connectSSHHost(host SSHHost, proxy *ssh.Client, deadline time.Time) (*ssh.C
 	defer closeAuth()
 
 	addr := sshAddress(host)
-	client, err := dialSSHWithDeadline(addr, config, proxy, deadline)
+	client, err := dialSSHWithRetry(addr, config, proxy, deadline)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}
@@ -646,7 +699,121 @@ func closeSSHClients(clients []*ssh.Client) {
 	}
 }
 
+func jumpChainKey(hosts []SSHHost) string {
+	var key strings.Builder
+	for _, host := range hosts {
+		host = normalizeSSHHost(host)
+		fmt.Fprintf(&key, "%q\x00%q\x00%q\x00%q\x00%q\x00", host.Name, host.Hostname, host.User, host.Port, host.IdentityFile)
+	}
+	return key.String()
+}
+
+func connectJumpChain(hosts []SSHHost, deadline time.Time) ([]*ssh.Client, error) {
+	var clients []*ssh.Client
+	var proxy *ssh.Client
+	for _, host := range hosts {
+		client, err := connectSSHHost(host, proxy, deadline)
+		if err != nil {
+			closeSSHClients(clients)
+			return nil, fmt.Errorf("failed to connect through jump host %s: %w", host.Name, err)
+		}
+		clients = append(clients, client)
+		proxy = client
+	}
+	return clients, nil
+}
+
+func (c *SSHConnector) releaseJumpChain(key string, chain *sharedJumpChain) {
+	c.mu.Lock()
+	if chain.refs > 0 {
+		chain.refs--
+	}
+	shouldClose := chain.refs == 0 && chain.complete
+	if shouldClose {
+		if current := c.jumpChains[key]; current == chain {
+			delete(c.jumpChains, key)
+		}
+	}
+	clients := chain.clients
+	c.mu.Unlock()
+
+	if shouldClose {
+		closeSSHClients(clients)
+	}
+}
+
+func (c *SSHConnector) acquireJumpChain(hosts []SSHHost, deadline time.Time) (*ssh.Client, func(), error) {
+	if len(hosts) == 0 {
+		return nil, nil, nil
+	}
+
+	key := jumpChainKey(hosts)
+	c.mu.Lock()
+	chain, found := c.jumpChains[key]
+	if found {
+		chain.refs++
+	} else {
+		chain = &sharedJumpChain{ready: make(chan struct{}), refs: 1}
+		c.jumpChains[key] = chain
+	}
+	c.mu.Unlock()
+
+	release := sync.OnceFunc(func() {
+		c.releaseJumpChain(key, chain)
+	})
+
+	if !found {
+		clients, err := connectJumpChain(hosts, deadline)
+
+		c.mu.Lock()
+		chain.clients = clients
+		chain.err = err
+		chain.complete = true
+		close(chain.ready)
+		shouldClose := chain.refs == 0
+		if shouldClose {
+			if current := c.jumpChains[key]; current == chain {
+				delete(c.jumpChains, key)
+			}
+		}
+		c.mu.Unlock()
+
+		if shouldClose {
+			closeSSHClients(clients)
+		}
+	} else {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			release()
+			return nil, nil, context.DeadlineExceeded
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case <-chain.ready:
+		case <-timer.C:
+			release()
+			return nil, nil, context.DeadlineExceeded
+		}
+	}
+
+	if chain.err != nil {
+		release()
+		return nil, nil, chain.err
+	}
+	if len(chain.clients) == 0 {
+		release()
+		return nil, nil, fmt.Errorf("jump chain connected without a client")
+	}
+
+	return chain.clients[len(chain.clients)-1], release, nil
+}
+
 func NewSSHClient(host SSHHost) (*SSHClient, error) {
+	return defaultSSHConnector.NewSSHClient(host)
+}
+
+func (c *SSHConnector) NewSSHClient(host SSHHost) (*SSHClient, error) {
 	host = normalizeSSHHost(host)
 	timeout := getSSHTimeout()
 	deadline := time.Now().Add(timeout)
@@ -656,28 +823,23 @@ func NewSSHClient(host SSHHost) (*SSHClient, error) {
 		return nil, err
 	}
 
-	var jumpClients []*ssh.Client
-	var proxy *ssh.Client
-	for _, jumpHost := range jumpHosts {
-		jumpClient, err := connectSSHHost(jumpHost, proxy, deadline)
-		if err != nil {
-			closeSSHClients(jumpClients)
-			return nil, fmt.Errorf("failed to connect through jump host %s: %w", jumpHost.Name, err)
-		}
-		jumpClients = append(jumpClients, jumpClient)
-		proxy = jumpClient
+	proxy, releaseJumpChain, err := c.acquireJumpChain(jumpHosts, deadline)
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := connectSSHHost(host, proxy, deadline)
 	if err != nil {
-		closeSSHClients(jumpClients)
+		if releaseJumpChain != nil {
+			releaseJumpChain()
+		}
 		return nil, err
 	}
 
 	return &SSHClient{
-		client:      client,
-		config:      &host,
-		jumpClients: jumpClients,
+		client:           client,
+		config:           &host,
+		releaseJumpChain: releaseJumpChain,
 	}, nil
 }
 
@@ -760,10 +922,13 @@ func (c *SSHClient) ExecuteCommand(cmd string) (string, error) {
 }
 
 func (c *SSHClient) Close() error {
-	var err error
-	if c.client != nil {
-		err = c.client.Close()
-	}
-	closeSSHClients(c.jumpClients)
-	return err
+	c.closeOnce.Do(func() {
+		if c.client != nil {
+			c.closeErr = c.client.Close()
+		}
+		if c.releaseJumpChain != nil {
+			c.releaseJumpChain()
+		}
+	})
+	return c.closeErr
 }

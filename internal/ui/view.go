@@ -26,18 +26,24 @@ func (m Model) renderUpdateNotification() string {
 		currentVer, m.updateInfo.LatestVersion))
 }
 
+func (m Model) renderConnectionFailures() string {
+	if len(m.failedHosts) == 0 {
+		return ""
+	}
+
+	failedDetails := make([]string, 0, len(m.failedHosts))
+	for hostName, err := range m.failedHosts {
+		failedDetails = append(failedDetails, fmt.Sprintf("%s (%v)", hostName, err))
+	}
+	warning := fmt.Sprintf("\n⚠ Failed to connect: %s", strings.Join(failedDetails, ", "))
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render(warning)
+}
+
 func (m Model) View() string {
 	switch m.screen {
 	case ScreenHostList:
 		listView := m.list.View()
-		if len(m.failedHosts) > 0 {
-			failedDetails := make([]string, 0, len(m.failedHosts))
-			for hostName, err := range m.failedHosts {
-				failedDetails = append(failedDetails, fmt.Sprintf("%s (%v)", hostName, err))
-			}
-			warning := fmt.Sprintf("\n⚠ Failed to connect: %s", strings.Join(failedDetails, ", "))
-			listView += lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render(warning)
-		}
+		listView += m.renderConnectionFailures()
 		if len(m.selectedHosts) > 0 {
 			selectedNames := make([]string, len(m.selectedHosts))
 			for i, h := range m.selectedHosts {
@@ -70,13 +76,13 @@ func (m Model) View() string {
 				hostIndicator = fmt.Sprintf(" [%d/%d]", m.currentHostIdx+1, len(m.selectedHosts))
 			}
 			dashboardView := renderDashboard(currentHost.Name+hostIndicator, sysInfo, m.updateInterval, lastUpdate, m.width, m.height, len(m.selectedHosts) > 1)
-			return dashboardView + m.renderUpdateNotification()
+			return dashboardView + m.renderConnectionFailures() + m.renderUpdateNotification()
 		}
 		return m.renderConnectingProgress()
 
 	case ScreenOverview:
 		overviewView := m.renderOverview()
-		return overviewView + m.renderUpdateNotification()
+		return overviewView + m.renderConnectionFailures() + m.renderUpdateNotification()
 	}
 
 	return ""

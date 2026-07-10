@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 func TestGetSSHTimeout(t *testing.T) {
@@ -189,6 +191,40 @@ func TestDialSSHThroughProxy(t *testing.T) {
 	targetClient.Close()
 }
 
+func TestDialSSHThroughProxyRetriesTransientFailure(t *testing.T) {
+	targetAddr := startTestSSHServer(t, func(channel ssh.NewChannel) {
+		_ = channel.Reject(ssh.UnknownChannelType, "unsupported channel")
+	})
+
+	var attempts atomic.Int32
+	jumpAddr := startTestSSHServer(t, func(channel ssh.NewChannel) {
+		if attempts.Add(1) == 1 {
+			_ = channel.Reject(ssh.ResourceShortage, "temporary forwarding limit")
+			return
+		}
+		forwardDirectTCPIP(channel)
+	})
+	config := &ssh.ClientConfig{
+		User:            "test",
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	jumpClient, err := dialSSH(jumpAddr, config, time.Second)
+	if err != nil {
+		t.Fatalf("connect to jump server: %v", err)
+	}
+	defer jumpClient.Close()
+
+	targetClient, err := dialSSHWithRetry(targetAddr, config, jumpClient, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatalf("connect to target after transient failure: %v", err)
+	}
+	targetClient.Close()
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("forward attempts = %d, want 2", got)
+	}
+}
+
 func TestDialSSHThroughProxyTimesOutDuringHandshake(t *testing.T) {
 	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -290,6 +326,93 @@ func TestNewSSHClientConfigTriesAllDefaultKeys(t *testing.T) {
 	client.Close()
 }
 
+func TestSSHConnectorSharesJumpChain(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatalf("create .ssh directory: %v", err)
+	}
+
+	_, identityKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate identity key: %v", err)
+	}
+	identityPath := filepath.Join(sshDir, "id_ed25519")
+	writeTestPrivateKey(t, identityPath, identityKey)
+
+	jumpAddr, jumpHostKey := startTestSSHServerForKnownHosts(t, &ssh.ServerConfig{NoClientAuth: true}, func(channel ssh.NewChannel) {
+		_ = channel.Reject(ssh.UnknownChannelType, "unsupported channel")
+	})
+	knownHosts := knownhosts.Line([]string{jumpAddr}, jumpHostKey) + "\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "known_hosts"), []byte(knownHosts), 0600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+
+	hostname, port, err := net.SplitHostPort(jumpAddr)
+	if err != nil {
+		t.Fatalf("split jump address: %v", err)
+	}
+	jumpHost := SSHHost{
+		Name:         "jump",
+		Hostname:     hostname,
+		User:         "test",
+		Port:         port,
+		IdentityFile: identityPath,
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("SSH_AUTH_SOCK", "")
+	connector := NewSSHConnector()
+
+	type result struct {
+		client  *ssh.Client
+		release func()
+		err     error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			client, release, err := connector.acquireJumpChain([]SSHHost{jumpHost}, time.Now().Add(time.Second))
+			results <- result{client: client, release: release, err: err}
+		}()
+	}
+	close(start)
+
+	first := <-results
+	second := <-results
+	if first.err != nil {
+		t.Fatalf("first acquireJumpChain() error: %v", first.err)
+	}
+	if second.err != nil {
+		first.release()
+		t.Fatalf("second acquireJumpChain() error: %v", second.err)
+	}
+	if first.client != second.client {
+		first.release()
+		second.release()
+		t.Fatal("acquireJumpChain() did not share the jump client")
+	}
+
+	first.release()
+	connector.mu.Lock()
+	remainingAfterFirstRelease := len(connector.jumpChains)
+	connector.mu.Unlock()
+	if remainingAfterFirstRelease != 1 {
+		second.release()
+		t.Fatalf("jump chain closed with an active reference")
+	}
+
+	second.release()
+	connector.mu.Lock()
+	remainingAfterSecondRelease := len(connector.jumpChains)
+	connector.mu.Unlock()
+	if remainingAfterSecondRelease != 0 {
+		t.Fatalf("jump chain remained after its final release")
+	}
+}
+
 func writeTestPrivateKey(t *testing.T, path string, key ed25519.PrivateKey) {
 	t.Helper()
 	block, err := ssh.MarshalPrivateKey(key, "test key")
@@ -307,6 +430,12 @@ func startTestSSHServer(t *testing.T, handleChannel func(ssh.NewChannel)) string
 }
 
 func startTestSSHServerWithConfig(t *testing.T, serverConfig *ssh.ServerConfig, handleChannel func(ssh.NewChannel)) string {
+	t.Helper()
+	addr, _ := startTestSSHServerForKnownHosts(t, serverConfig, handleChannel)
+	return addr
+}
+
+func startTestSSHServerForKnownHosts(t *testing.T, serverConfig *ssh.ServerConfig, handleChannel func(ssh.NewChannel)) (string, ssh.PublicKey) {
 	t.Helper()
 
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
@@ -355,7 +484,7 @@ func startTestSSHServerWithConfig(t *testing.T, serverConfig *ssh.ServerConfig, 
 		}
 	})
 
-	return listener.Addr().String()
+	return listener.Addr().String(), signer.PublicKey()
 }
 
 func forwardDirectTCPIP(newChannel ssh.NewChannel) {
