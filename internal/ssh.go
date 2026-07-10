@@ -3,15 +3,24 @@ package internal
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
+)
+
+const (
+	sshTimeoutEnv     = "SSH_DASHBOARD_TIMEOUT"
+	defaultSSHTimeout = 10 * time.Second
+	minSSHTimeout     = 10 * time.Millisecond
+	maxSSHTimeout     = time.Hour
 )
 
 type SSHHost struct {
@@ -288,6 +297,53 @@ func getValidatedSSHAuthSock() string {
 	return ""
 }
 
+func getSSHTimeout() time.Duration {
+	value := os.Getenv(sshTimeoutEnv)
+	if value == "" {
+		return defaultSSHTimeout
+	}
+
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return defaultSSHTimeout
+	}
+
+	timeout := time.Duration(seconds * float64(time.Second))
+	if timeout < minSSHTimeout || timeout > maxSSHTimeout {
+		return defaultSSHTimeout
+	}
+
+	return timeout
+}
+
+func dialSSH(addr string, config *ssh.ClientConfig, timeout time.Duration) (*ssh.Client, error) {
+	deadline := time.Now().Add(timeout)
+	dialer := net.Dialer{Deadline: deadline}
+
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	clientConn, channels, requests, err := ssh.NewClientConn(conn, addr, config)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		clientConn.Close()
+		return nil, err
+	}
+
+	return ssh.NewClient(clientConn, channels, requests), nil
+}
+
 func NewSSHClient(host SSHHost) (*SSHClient, error) {
 	if host.Hostname == "" {
 		host.Hostname = host.Name
@@ -340,15 +396,16 @@ func NewSSHClient(host SSHHost) (*SSHClient, error) {
 		return nil, fmt.Errorf("failed to setup host key verification: %w", err)
 	}
 
+	timeout := getSSHTimeout()
 	config := &ssh.ClientConfig{
 		User:            host.User,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
-		Timeout:         10 * time.Second,
+		Timeout:         timeout,
 	}
 
 	addr := fmt.Sprintf("%s:%s", host.Hostname, host.Port)
-	client, err := ssh.Dial("tcp", addr, config)
+	client, err := dialSSH(addr, config, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 	}

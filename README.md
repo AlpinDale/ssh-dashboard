@@ -102,6 +102,16 @@ export SSH_DASHBOARD_INTERVAL=0.5
 ssh-dashboard
 ```
 
+**Connection Timeout:**
+
+Set the maximum time allowed for a connection, including the SSH handshake and authentication, in seconds (default: 10). Decimal values are supported:
+
+```bash
+# Stop trying to connect after 3 seconds
+export SSH_DASHBOARD_TIMEOUT=3
+ssh-dashboard
+```
+
 **Keybindings:**
 - `q` or `Ctrl+C` - Quit
 - `Space` - Select/deselect hosts (in host selection screen)

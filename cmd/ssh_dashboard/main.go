@@ -34,6 +34,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nArguments:\n")
 		fmt.Fprintf(os.Stderr, "  HOST...               One or more hostnames from SSH config to connect to directly\n")
 		fmt.Fprintf(os.Stderr, "                        Example: ssh-dashboard myHost myOtherHost\n")
+		fmt.Fprintf(os.Stderr, "\nEnvironment:\n")
+		fmt.Fprintf(os.Stderr, "  SSH_DASHBOARD_TIMEOUT Connection timeout in seconds (default: 10)\n")
 	}
 
 	var updateIntervalVal float64
