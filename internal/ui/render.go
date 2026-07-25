@@ -45,6 +45,62 @@ func thermalVisualPercent(rawPercent float64) float64 {
 	return 20.0 + (rawPercent-75.0)*(80.0/25.0)
 }
 
+func formatPCIeStatus(gpu internal.GPUInfo) string {
+	if gpu.PCIeGen <= 0 && gpu.PCIeWidth <= 0 {
+		return ""
+	}
+	if gpu.PCIeGen > 0 && gpu.PCIeWidth > 0 {
+		return fmt.Sprintf("Gen%d @ %dx", gpu.PCIeGen, gpu.PCIeWidth)
+	}
+	if gpu.PCIeGen > 0 {
+		return fmt.Sprintf("Gen%d", gpu.PCIeGen)
+	}
+	return fmt.Sprintf("%dx", gpu.PCIeWidth)
+}
+
+func pcieStatusColor(gen, width int) lipgloss.Color {
+	genScore := 0.0
+	if gen > 0 {
+		if gen <= 1 {
+			genScore = 0
+		} else if gen >= 5 {
+			genScore = 1
+		} else {
+			genScore = float64(gen-1) / 4.0
+		}
+	}
+
+	laneScore := 0.0
+	if width > 0 {
+		if width <= 1 {
+			laneScore = 0
+		} else if width >= 16 {
+			laneScore = 1
+		} else if width <= 4 {
+			laneScore = ((float64(width) - 1.0) / 3.0) * (1.0 / 3.0)
+		} else if width <= 8 {
+			laneScore = (1.0 / 3.0) + ((float64(width)-4.0)/4.0)*(1.0/3.0)
+		} else {
+			laneScore = (2.0 / 3.0) + ((float64(width)-8.0)/8.0)*(1.0/3.0)
+		}
+	}
+
+	score := genScore*0.6 + laneScore*0.4
+	if score <= 0.2 {
+		return lipgloss.Color("196")
+	}
+	if score <= 0.4 {
+		return lipgloss.Color("208")
+	}
+	if score <= 0.6 {
+		return lipgloss.Color("226")
+	}
+	if score <= 0.8 {
+		return lipgloss.Color("118")
+	}
+	return lipgloss.Color("46")
+}
+
 func clampInt(v, low, high int) int {
 	if v < low {
 		return low
@@ -728,7 +784,24 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int, compactGPU bool) strin
 		tempColor = lipgloss.Color("196") // Red
 	}
 
-	b.WriteString(fmt.Sprintf("  %s  %s\n", gpuIndex, gpuName))
+	leftTitle := fmt.Sprintf("%s  %s", gpuIndex, gpuName)
+	pcieInfo := formatPCIeStatus(gpu)
+	if pcieInfo == "" {
+		b.WriteString("  " + leftTitle + "\n")
+	} else {
+		pcieLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Render("PCIe:")
+		pcieValue := lipgloss.NewStyle().Foreground(pcieStatusColor(gpu.PCIeGen, gpu.PCIeWidth)).Render(pcieInfo)
+		rightTitle := pcieLabel + " " + pcieValue
+
+		innerWidth := clampInt(cardWidth-2, 30, 238)
+		padding := innerWidth - lipgloss.Width(leftTitle) - lipgloss.Width(rightTitle)
+		if padding < 1 {
+			b.WriteString("  " + leftTitle + "\n")
+			b.WriteString("  " + rightTitle + "\n")
+		} else {
+			b.WriteString("  " + leftTitle + strings.Repeat(" ", padding) + rightTitle + "\n")
+		}
+	}
 	if compactGPU {
 		compactInfo := fmt.Sprintf("  %.1f/%.1fG | %d%% util | %dW | %d°C", vramUsedGB, vramTotalGB, gpu.Utilization, gpu.PowerDraw, gpu.Temperature)
 		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(compactInfo))
@@ -736,14 +809,14 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int, compactGPU bool) strin
 
 		compactBarWidth := clampInt(barWidth-10, 8, 210)
 
-		vramLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("VRAM")
-		b.WriteString(fmt.Sprintf("  %-5s %s\n", vramLabel, renderProgressBar(vramPercent, compactBarWidth, lipgloss.Color("39"))))
+		vramLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Width(5).Render("VRAM")
+		b.WriteString(fmt.Sprintf("  %s %s\n", vramLabel, renderProgressBar(vramPercent, compactBarWidth, lipgloss.Color("39"))))
 
-		utilLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render("UTIL")
-		b.WriteString(fmt.Sprintf("  %-5s %s\n", utilLabel, renderProgressBar(float64(gpu.Utilization), compactBarWidth, lipgloss.Color("208"))))
+		utilLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Width(5).Render("UTIL")
+		b.WriteString(fmt.Sprintf("  %s %s\n", utilLabel, renderProgressBar(float64(gpu.Utilization), compactBarWidth, lipgloss.Color("208"))))
 
-		powerLabel := lipgloss.NewStyle().Foreground(powerColor).Render("PWR")
-		b.WriteString(fmt.Sprintf("  %-5s %s\n", powerLabel, renderProgressBar(powerPercent, compactBarWidth, powerColor)))
+		powerLabel := lipgloss.NewStyle().Foreground(powerColor).Width(5).Render("PWR")
+		b.WriteString(fmt.Sprintf("  %s %s\n", powerLabel, renderProgressBar(powerPercent, compactBarWidth, powerColor)))
 
 		tempLimit := gpu.TempLimit
 		if tempLimit <= 0 {
@@ -754,8 +827,8 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int, compactGPU bool) strin
 			tempPercent = 100
 		}
 		tempVisual := thermalVisualPercent(tempPercent)
-		tempLabel := lipgloss.NewStyle().Foreground(tempColor).Render("TEMP")
-		b.WriteString(fmt.Sprintf("  %-5s %s\n", tempLabel, renderProgressBar(tempVisual, compactBarWidth, tempColor)))
+		tempLabel := lipgloss.NewStyle().Foreground(tempColor).Width(5).Render("TEMP")
+		b.WriteString(fmt.Sprintf("  %s %s\n", tempLabel, renderProgressBar(tempVisual, compactBarWidth, tempColor)))
 
 		return lipgloss.NewStyle().Width(cardWidth).Render(b.String())
 	}

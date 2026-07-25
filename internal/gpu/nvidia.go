@@ -19,9 +19,9 @@ func (p NvidiaProvider) Detect(runCmd base.RunCmdFunc) bool {
 }
 
 func (p NvidiaProvider) Query(runCmd base.RunCmdFunc) ([]base.Device, error) {
-	output, err := runCmd("nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu,temperature.gpu.tlimit,driver_version --format=csv,noheader,nounits")
+	output, err := runCmd("nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu,temperature.gpu.tlimit,driver_version,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader,nounits")
 	if err != nil {
-		output, err = runCmd("nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu,driver_version --format=csv,noheader,nounits")
+		output, err = runCmd("nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu,driver_version,pcie.link.gen.current,pcie.link.width.current --format=csv,noheader,nounits")
 	}
 	if err != nil {
 		return nil, err
@@ -64,13 +64,31 @@ func (p NvidiaProvider) Query(runCmd base.RunCmdFunc) ([]base.Device, error) {
 				device.Temperature = val
 			}
 
-			if len(parts) >= 10 {
-				if val, err := strconv.Atoi(strings.TrimSpace(parts[8])); err == nil {
+			// The primary query includes temperature.gpu.tlimit (12 fields total);
+			// the fallback query for older drivers omits it (11 fields total).
+			// Track the next field to read explicitly so driver/PCIe fields don't
+			// shift depending on which query succeeded.
+			idx := 8
+			if len(parts) >= 12 {
+				if val, err := strconv.Atoi(strings.TrimSpace(parts[idx])); err == nil {
 					device.TempLimit = val
 				}
-				device.Driver = strings.TrimSpace(parts[9])
-			} else {
-				device.Driver = strings.TrimSpace(parts[8])
+				idx++
+			}
+			if idx < len(parts) {
+				device.Driver = strings.TrimSpace(parts[idx])
+				idx++
+			}
+			if idx < len(parts) {
+				if val, err := strconv.Atoi(strings.TrimSpace(parts[idx])); err == nil {
+					device.PCIeGen = val
+				}
+				idx++
+			}
+			if idx < len(parts) {
+				if val, err := strconv.Atoi(strings.TrimSpace(parts[idx])); err == nil {
+					device.PCIeWidth = val
+				}
 			}
 
 			devices = append(devices, device)

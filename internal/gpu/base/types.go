@@ -11,6 +11,8 @@ type Device struct {
 	PowerLimit  int // watts
 	Temperature int // celsius
 	TempLimit   int // celsius (throttle/limit)
+	PCIeGen     int // current PCIe generation
+	PCIeWidth   int // current PCIe lane width
 	Driver      string
 	Vendor      string
 }
