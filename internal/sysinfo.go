@@ -53,6 +53,8 @@ type GPUInfo struct {
 	PowerLimit  int // in Watts
 	Temperature int // in Celsius
 	TempLimit   int // in Celsius
+	PCIeGen     int // current PCIe generation
+	PCIeWidth   int // current PCIe lane width
 }
 
 type RAMInfo struct {
@@ -361,6 +363,8 @@ func getGPUInfo(client *SSHClient) ([]GPUInfo, string, string, error) {
 			PowerLimit:  dev.PowerLimit,
 			Temperature: dev.Temperature,
 			TempLimit:   dev.TempLimit,
+			PCIeGen:     dev.PCIeGen,
+			PCIeWidth:   dev.PCIeWidth,
 		}
 	}
 
