@@ -88,6 +88,109 @@ func gridDimensions(totalWidth, itemCount, minColumnWidth, maxColumns int) (int,
 	return bestColumns, bestWidth
 }
 
+func coreGridDimensions(totalWidth, totalHeight, itemCount int) (int, int) {
+	if itemCount <= 0 {
+		return 1, effectiveWidth(totalWidth)
+	}
+
+	totalWidth = effectiveWidth(totalWidth)
+	const (
+		minColumnWidth = 33
+		maxColumns     = 4
+		gapWidth       = 2
+		reservedLines  = 22
+	)
+
+	maxFitByWidth := (totalWidth + gapWidth) / (minColumnWidth + gapWidth)
+	columns := clampInt(maxFitByWidth, 1, maxColumns)
+	if columns > itemCount {
+		columns = itemCount
+	}
+
+	availableRows := totalHeight - reservedLines
+	if availableRows < 1 {
+		availableRows = 1
+	}
+	for columns < maxColumns && columns < itemCount {
+		rows := (itemCount + columns - 1) / columns
+		if rows <= availableRows {
+			break
+		}
+		next := columns + 1
+		nextWidth := (totalWidth - gapWidth*(next-1)) / next
+		if nextWidth < minColumnWidth {
+			break
+		}
+		columns = next
+	}
+
+	columnWidth := (totalWidth - gapWidth*(columns-1)) / columns
+	if columnWidth < minColumnWidth {
+		columnWidth = minColumnWidth
+	}
+
+	return columns, columnWidth
+}
+
+func coreUsageColor(usage float64) lipgloss.Color {
+	if usage < 45 {
+		return lipgloss.Color("10")
+	}
+	if usage < 80 {
+		return lipgloss.Color("208")
+	}
+	return lipgloss.Color("196")
+}
+
+func renderCoreMeters(coreGroups []internal.CPUCoreGroup, totalWidth, totalHeight int) string {
+	if len(coreGroups) == 0 {
+		return ""
+	}
+
+	contentWidth := effectiveWidth(totalWidth) - 4
+	columns, cellWidth := coreGridDimensions(contentWidth, totalHeight, len(coreGroups))
+	barWidth := clampInt((cellWidth-29)/2, 2, 10)
+
+	var b strings.Builder
+	for i := 0; i < len(coreGroups); i += columns {
+		cells := make([]string, 0, columns)
+		for j := i; j < i+columns && j < len(coreGroups); j++ {
+			group := coreGroups[j]
+			coreLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render(fmt.Sprintf("C%02d", j+1))
+
+			threadSegment := func(threadIdx int) string {
+				if threadIdx >= len(group.Threads) {
+					return strings.Repeat(" ", 12+barWidth)
+				}
+				thread := group.Threads[threadIdx]
+				usage := thread.Usage
+				if usage < 0 {
+					usage = 0
+				}
+				if usage > 100 {
+					usage = 100
+				}
+
+				role := "Core"
+				if threadIdx > 0 {
+					role = "Thread"
+				}
+				label := fmt.Sprintf("%-6s %3.0f%% ", role, usage)
+				bar := renderProgressBar(usage, barWidth, coreUsageColor(usage))
+				return label + bar
+			}
+
+			cellContent := coreLabel + " " + threadSegment(0) + " " + threadSegment(1)
+			cell := lipgloss.NewStyle().Width(cellWidth).Align(lipgloss.Center).Render(cellContent)
+			cells = append(cells, cell)
+		}
+		b.WriteString(joinColumns(cells))
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
 func gpuGridDimensions(totalWidth, totalHeight, itemCount int) (int, int) {
 	if itemCount <= 0 {
 		return 1, effectiveWidth(totalWidth)
@@ -353,7 +456,7 @@ func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval 
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(subtitle))
 	b.WriteString("\n\n")
 
-	b.WriteString(renderCPUSection(info.CPU))
+	b.WriteString(renderCPUSection(info.CPU, width, height))
 	b.WriteString("\n")
 
 	b.WriteString(renderRAMAndDiskSection(info.RAM, info.Disk))
@@ -371,19 +474,39 @@ func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval 
 	return fillToHeight(b.String(), height)
 }
 
-func renderCPUSection(cpu internal.CPUInfo) string {
+func renderCPUSection(cpu internal.CPUInfo, totalWidth, totalHeight int) string {
+	var b strings.Builder
 	var parts []string
 
 	if cpu.Model != "" {
 		parts = append(parts, cpu.Model)
 	}
 	if cpu.Count != "" {
-		parts = append(parts, fmt.Sprintf("%s cores", cpu.Count))
+		parts = append(parts, fmt.Sprintf("%s CPUs", cpu.Count))
+	}
+	if len(cpu.CoreGroups) > 0 {
+		parts = append(parts, fmt.Sprintf("Physical Cores: %d", len(cpu.CoreGroups)))
 	}
 	parts = append(parts, fmt.Sprintf("Usage: %s", cpu.Usage))
 
 	cpuInfo := strings.Join(parts, "  |  ")
-	return headerStyle.Render("● CPU") + "  " + cpuInfo + "\n"
+	line := headerStyle.Render("● CPU") + "  " + cpuInfo
+	b.WriteString(line)
+	b.WriteString("\n")
+
+	if len(cpu.CoreGroups) > 0 {
+		meters := renderCoreMeters(cpu.CoreGroups, totalWidth, totalHeight)
+		for _, meterLine := range strings.Split(strings.TrimSuffix(meters, "\n"), "\n") {
+			if meterLine == "" {
+				continue
+			}
+			b.WriteString("  ")
+			b.WriteString(meterLine)
+			b.WriteString("\n")
+		}
+	}
+
+	return b.String()
 }
 
 func renderAggregateGPUSection(gpus []internal.GPUInfo, totalWidth, totalHeight int) string {
