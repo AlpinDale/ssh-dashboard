@@ -30,6 +30,21 @@ func renderProgressBar(percent float64, width int, color lipgloss.Color) string 
 	return bar
 }
 
+func thermalVisualPercent(rawPercent float64) float64 {
+	if rawPercent < 0 {
+		rawPercent = 0
+	}
+	if rawPercent > 100 {
+		rawPercent = 100
+	}
+
+	if rawPercent <= 75 {
+		return rawPercent * (20.0 / 75.0)
+	}
+
+	return 20.0 + (rawPercent-75.0)*(80.0/25.0)
+}
+
 func clampInt(v, low, high int) int {
 	if v < low {
 		return low
@@ -337,7 +352,7 @@ func (m Model) renderSingleHostOverview(host internal.SSHHost, sectionWidth int)
 	return lipgloss.NewStyle().Width(sectionWidth).Render(b.String())
 }
 
-func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval time.Duration, lastUpdate time.Time, width, height int, multiHost bool) string {
+func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval time.Duration, lastUpdate time.Time, width, height int, multiHost bool, compactGPU bool) string {
 	var b strings.Builder
 
 	title := fmt.Sprintf("  System Dashboard - %s  ", hostName)
@@ -345,8 +360,12 @@ func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval 
 	if multiHost {
 		navHint = " | 'n' next | 't' overview"
 	}
-	subtitle := fmt.Sprintf("v%s | Last Updated: %s | Interval: %s%s | 's' shell | 'c' add hosts | 'q' quit",
-		internal.ShortVersion(), lastUpdate.Format("15:04:05"), formatInterval(updateInterval), navHint)
+	compactHint := "off"
+	if compactGPU {
+		compactHint = "on"
+	}
+	subtitle := fmt.Sprintf("v%s | Last Updated: %s | Interval: %s%s | 'm' gpu compact:%s | 's' shell | 'c' add hosts | 'q' quit",
+		internal.ShortVersion(), lastUpdate.Format("15:04:05"), formatInterval(updateInterval), navHint, compactHint)
 
 	b.WriteString(titleStyle.Render(title))
 	b.WriteString("\n")
@@ -365,7 +384,7 @@ func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval 
 
 	if len(info.GPUs) > 0 {
 		b.WriteString("\n")
-		b.WriteString(renderGPUSection(info.GPUs, info.GPUDriverVersion, info.CUDAVersion, width, height))
+		b.WriteString(renderGPUSection(info.GPUs, info.GPUDriverVersion, info.CUDAVersion, width, height, compactGPU))
 	}
 
 	return fillToHeight(b.String(), height)
@@ -432,7 +451,7 @@ func renderAggregateGPUSection(gpus []internal.GPUInfo, totalWidth, totalHeight 
 	return b.String()
 }
 
-func renderGPUSection(gpus []internal.GPUInfo, driverVersion, cudaVersion string, totalWidth, totalHeight int) string {
+func renderGPUSection(gpus []internal.GPUInfo, driverVersion, cudaVersion string, totalWidth, totalHeight int, compactGPU bool) string {
 	var b strings.Builder
 
 	b.WriteString(headerStyle.Render("● GPU Information"))
@@ -477,7 +496,7 @@ func renderGPUSection(gpus []internal.GPUInfo, driverVersion, cudaVersion string
 
 		cards := make([]string, 0, rowCount)
 		for j := i; j < i+rowCount && j < len(gpus); j++ {
-			cards = append(cards, renderSingleGPU(gpus[j], rowCardWidth))
+			cards = append(cards, renderSingleGPU(gpus[j], rowCardWidth, compactGPU))
 		}
 		b.WriteString(joinColumns(cards))
 		b.WriteString("\n")
@@ -486,7 +505,7 @@ func renderGPUSection(gpus []internal.GPUInfo, driverVersion, cudaVersion string
 	return b.String()
 }
 
-func renderSingleGPU(gpu internal.GPUInfo, cardWidth int) string {
+func renderSingleGPU(gpu internal.GPUInfo, cardWidth int, compactGPU bool) string {
 	var b strings.Builder
 
 	cardWidth = clampInt(cardWidth, 52, 240)
@@ -533,6 +552,36 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int) string {
 	}
 
 	b.WriteString(fmt.Sprintf("  %s  %s\n", gpuIndex, gpuName))
+	if compactGPU {
+		compactInfo := fmt.Sprintf("  %.1f/%.1fG | %d%% util | %dW | %d°C", vramUsedGB, vramTotalGB, gpu.Utilization, gpu.PowerDraw, gpu.Temperature)
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(compactInfo))
+		b.WriteString("\n")
+
+		compactBarWidth := clampInt(barWidth-10, 8, 210)
+
+		vramLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("VRAM")
+		b.WriteString(fmt.Sprintf("  %-5s %s\n", vramLabel, renderProgressBar(vramPercent, compactBarWidth, lipgloss.Color("39"))))
+
+		utilLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render("UTIL")
+		b.WriteString(fmt.Sprintf("  %-5s %s\n", utilLabel, renderProgressBar(float64(gpu.Utilization), compactBarWidth, lipgloss.Color("208"))))
+
+		powerLabel := lipgloss.NewStyle().Foreground(powerColor).Render("PWR")
+		b.WriteString(fmt.Sprintf("  %-5s %s\n", powerLabel, renderProgressBar(powerPercent, compactBarWidth, powerColor)))
+
+		tempLimit := gpu.TempLimit
+		if tempLimit <= 0 {
+			tempLimit = 83
+		}
+		tempPercent := (float64(gpu.Temperature) / float64(tempLimit)) * 100
+		if tempPercent > 100 {
+			tempPercent = 100
+		}
+		tempVisual := thermalVisualPercent(tempPercent)
+		tempLabel := lipgloss.NewStyle().Foreground(tempColor).Render("TEMP")
+		b.WriteString(fmt.Sprintf("  %-5s %s\n", tempLabel, renderProgressBar(tempVisual, compactBarWidth, tempColor)))
+
+		return lipgloss.NewStyle().Width(cardWidth).Render(b.String())
+	}
 
 	vramLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("VRAM")
 	b.WriteString(fmt.Sprintf("  %s %.1f/%.1f GB (%.1f%%)\n", vramLabel, vramUsedGB, vramTotalGB, vramPercent))
@@ -567,10 +616,11 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int) string {
 	if tempPercent > 100 {
 		tempPercent = 100
 	}
+	tempVisual := thermalVisualPercent(tempPercent)
 	tempLabel := lipgloss.NewStyle().Foreground(tempColor).Render("Temperature")
 	b.WriteString(fmt.Sprintf("  %s %d/%d°C (%.1f%%)\n", tempLabel, gpu.Temperature, tempLimit, tempPercent))
 	b.WriteString("  ")
-	b.WriteString(renderProgressBar(tempPercent, barWidth, tempColor))
+	b.WriteString(renderProgressBar(tempVisual, barWidth, tempColor))
 	b.WriteString("\n")
 
 	return lipgloss.NewStyle().Width(cardWidth).Render(b.String())
