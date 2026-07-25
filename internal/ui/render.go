@@ -30,6 +30,141 @@ func renderProgressBar(percent float64, width int, color lipgloss.Color) string 
 	return bar
 }
 
+func clampInt(v, low, high int) int {
+	if v < low {
+		return low
+	}
+	if v > high {
+		return high
+	}
+	return v
+}
+
+func effectiveWidth(width int) int {
+	if width <= 0 {
+		return 120
+	}
+	return width
+}
+
+func gridDimensions(totalWidth, itemCount, minColumnWidth, maxColumns int) (int, int) {
+	if itemCount <= 0 {
+		return 1, effectiveWidth(totalWidth)
+	}
+
+	totalWidth = effectiveWidth(totalWidth)
+	if maxColumns < 1 {
+		maxColumns = 1
+	}
+
+	const gapWidth = 4
+
+	bestColumns := 1
+	bestWidth := totalWidth
+	bestScore := int(^uint(0) >> 1)
+
+	limit := clampInt(itemCount, 1, maxColumns)
+	for columns := 1; columns <= limit; columns++ {
+		columnWidth := (totalWidth - gapWidth*(columns-1)) / columns
+		if columnWidth < minColumnWidth {
+			continue
+		}
+
+		rows := (itemCount + columns - 1) / columns
+		emptySlots := rows*columns - itemCount
+		balance := rows - columns
+		if balance < 0 {
+			balance = -balance
+		}
+
+		score := rows*100 + balance*10 + emptySlots*5 - columns
+		if score < bestScore {
+			bestScore = score
+			bestColumns = columns
+			bestWidth = columnWidth
+		}
+	}
+
+	return bestColumns, bestWidth
+}
+
+func gpuGridDimensions(totalWidth, totalHeight, itemCount int) (int, int) {
+	if itemCount <= 0 {
+		return 1, effectiveWidth(totalWidth)
+	}
+
+	totalWidth = effectiveWidth(totalWidth)
+	const (
+		minColumnWidth = 52
+		maxColumns     = 4
+		gapWidth       = 4
+	)
+	_ = totalHeight
+
+	bestColumns := 1
+	bestWidth := totalWidth
+	bestScore := int(^uint(0) >> 1)
+
+	limit := clampInt(itemCount, 1, maxColumns)
+	for columns := 1; columns <= limit; columns++ {
+		columnWidth := (totalWidth - gapWidth*(columns-1)) / columns
+		if columnWidth < minColumnWidth {
+			continue
+		}
+
+		rows := (itemCount + columns - 1) / columns
+		emptySlots := rows*columns - itemCount
+		balance := rows - columns
+		if balance < 0 {
+			balance = -balance
+		}
+
+		score := rows*100 + balance*10 + emptySlots*5 - columns
+		if score < bestScore {
+			bestScore = score
+			bestColumns = columns
+			bestWidth = columnWidth
+		}
+	}
+
+	return bestColumns, bestWidth
+}
+
+func joinColumns(columns []string) string {
+	if len(columns) == 0 {
+		return ""
+	}
+
+	row := columns[0]
+	for i := 1; i < len(columns); i++ {
+		row = lipgloss.JoinHorizontal(lipgloss.Top, row, "    ", columns[i])
+	}
+
+	return row
+}
+
+func fillToHeight(content string, height int) string {
+	if height <= 0 {
+		return content
+	}
+	trimmed := strings.TrimRight(content, "\n")
+	if trimmed == "" {
+		return strings.Repeat("\n", height)
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) > height {
+		return strings.Join(lines[:height], "\n")
+	}
+
+	content = strings.Join(lines, "\n")
+	lineCount := lipgloss.Height(content)
+	if lineCount >= height {
+		return content
+	}
+	return content + strings.Repeat("\n", height-lineCount)
+}
+
 func (m Model) renderConnectingProgress() string {
 	var b strings.Builder
 
@@ -95,26 +230,37 @@ func (m Model) renderOverview() string {
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(subtitle))
 	b.WriteString("\n\n")
 
-	for i := 0; i < len(m.selectedHosts); i += 2 {
-		var leftHost, rightHost string
+	contentWidth := effectiveWidth(m.width) - 2
+	columns, cardWidth := gridDimensions(contentWidth, len(m.selectedHosts), 44, 3)
+	const gapWidth = 4
 
-		leftHost = m.renderSingleHostOverview(m.selectedHosts[i])
-
-		if i+1 < len(m.selectedHosts) {
-			rightHost = m.renderSingleHostOverview(m.selectedHosts[i+1])
-			row := lipgloss.JoinHorizontal(lipgloss.Top, leftHost, "    ", rightHost)
-			b.WriteString(row)
-		} else {
-			b.WriteString(leftHost)
+	for i := 0; i < len(m.selectedHosts); i += columns {
+		rowCount := columns
+		if remaining := len(m.selectedHosts) - i; remaining < rowCount {
+			rowCount = remaining
 		}
+
+		rowCardWidth := cardWidth
+		if rowCount > 0 {
+			rowCardWidth = (contentWidth - gapWidth*(rowCount-1)) / rowCount
+		}
+
+		cards := make([]string, 0, rowCount)
+		for j := i; j < i+rowCount && j < len(m.selectedHosts); j++ {
+			cards = append(cards, m.renderSingleHostOverview(m.selectedHosts[j], rowCardWidth))
+		}
+		b.WriteString(joinColumns(cards))
 		b.WriteString("\n")
 	}
 
-	return b.String()
+	return fillToHeight(b.String(), m.height)
 }
 
-func (m Model) renderSingleHostOverview(host internal.SSHHost) string {
+func (m Model) renderSingleHostOverview(host internal.SSHHost, sectionWidth int) string {
 	var b strings.Builder
+
+	sectionWidth = clampInt(sectionWidth, 44, 120)
+	barWidth := clampInt(sectionWidth-4, 20, 90)
 
 	sysInfo := m.sysInfos[host.Name]
 
@@ -123,7 +269,7 @@ func (m Model) renderSingleHostOverview(host internal.SSHHost) string {
 		b.WriteString("  ")
 		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Loading..."))
 		b.WriteString("\n")
-		return b.String()
+		return lipgloss.NewStyle().Width(sectionWidth).Render(b.String())
 	}
 
 	b.WriteString(headerStyle.Render(fmt.Sprintf("● %s", host.Name)))
@@ -173,7 +319,6 @@ func (m Model) renderSingleHostOverview(host internal.SSHHost) string {
 			avgUtil = totalUtil / len(sysInfo.GPUs)
 		}
 
-		barWidth := 50
 		vramBar := renderProgressBar(vramPercent, barWidth, lipgloss.Color("33"))
 		utilBar := renderProgressBar(float64(avgUtil), barWidth, lipgloss.Color("208"))
 
@@ -182,14 +327,14 @@ func (m Model) renderSingleHostOverview(host internal.SSHHost) string {
 		b.WriteString(fmt.Sprintf("  GPU Util: %d%% avg\n", avgUtil))
 		b.WriteString("  " + utilBar + "\n")
 	} else {
-		paddingLine := strings.Repeat(" ", 52)
+		paddingLine := strings.Repeat(" ", barWidth)
 		b.WriteString("  GPU: N/A\n")
 		b.WriteString(paddingLine + "\n")
 		b.WriteString(paddingLine + "\n")
 		b.WriteString(paddingLine + "\n")
 	}
 
-	return b.String()
+	return lipgloss.NewStyle().Width(sectionWidth).Render(b.String())
 }
 
 func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval time.Duration, lastUpdate time.Time, width, height int, multiHost bool) string {
@@ -215,15 +360,15 @@ func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval 
 
 	if len(info.GPUs) > 1 {
 		b.WriteString("\n")
-		b.WriteString(renderAggregateGPUSection(info.GPUs))
+		b.WriteString(renderAggregateGPUSection(info.GPUs, width, height))
 	}
 
 	if len(info.GPUs) > 0 {
 		b.WriteString("\n")
-		b.WriteString(renderGPUSection(info.GPUs))
+		b.WriteString(renderGPUSection(info.GPUs, width, height))
 	}
 
-	return b.String()
+	return fillToHeight(b.String(), height)
 }
 
 func renderCPUSection(cpu internal.CPUInfo) string {
@@ -241,7 +386,7 @@ func renderCPUSection(cpu internal.CPUInfo) string {
 	return headerStyle.Render("● CPU") + "  " + cpuInfo + "\n"
 }
 
-func renderAggregateGPUSection(gpus []internal.GPUInfo) string {
+func renderAggregateGPUSection(gpus []internal.GPUInfo, totalWidth, totalHeight int) string {
 	var b strings.Builder
 
 	var totalVRAM, usedVRAM int
@@ -267,7 +412,10 @@ func renderAggregateGPUSection(gpus []internal.GPUInfo) string {
 	b.WriteString(headerStyle.Render("● Total GPU Pressure"))
 	b.WriteString("\n\n")
 
-	const fullBarWidth = 106
+	contentWidth := effectiveWidth(totalWidth) - 2
+	columns, cardWidth := gpuGridDimensions(contentWidth, totalHeight, len(gpus))
+	rowWidth := columns*cardWidth + (columns-1)*4
+	fullBarWidth := clampInt(rowWidth-2, 24, 400)
 
 	vramLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("VRAM")
 	b.WriteString(fmt.Sprintf("  %s %.1f/%.1f GB (%.1f%%) across %d GPUs\n", vramLabel, usedVRAMGB, totalVRAMGB, vramPercent, len(gpus)))
@@ -284,32 +432,43 @@ func renderAggregateGPUSection(gpus []internal.GPUInfo) string {
 	return b.String()
 }
 
-func renderGPUSection(gpus []internal.GPUInfo) string {
+func renderGPUSection(gpus []internal.GPUInfo, totalWidth, totalHeight int) string {
 	var b strings.Builder
 
 	b.WriteString(headerStyle.Render("● GPU Information"))
 	b.WriteString("\n\n")
 
-	for i := 0; i < len(gpus); i += 2 {
-		var leftGPU, rightGPU string
+	contentWidth := effectiveWidth(totalWidth) - 2
+	columns, cardWidth := gpuGridDimensions(contentWidth, totalHeight, len(gpus))
+	const gapWidth = 4
 
-		leftGPU = renderSingleGPU(gpus[i])
-
-		if i+1 < len(gpus) {
-			rightGPU = renderSingleGPU(gpus[i+1])
-			row := lipgloss.JoinHorizontal(lipgloss.Top, leftGPU, "    ", rightGPU)
-			b.WriteString(row)
-		} else {
-			b.WriteString(leftGPU)
+	for i := 0; i < len(gpus); i += columns {
+		rowCount := columns
+		if remaining := len(gpus) - i; remaining < rowCount {
+			rowCount = remaining
 		}
+
+		rowCardWidth := cardWidth
+		if rowCount > 0 {
+			rowCardWidth = (contentWidth - gapWidth*(rowCount-1)) / rowCount
+		}
+
+		cards := make([]string, 0, rowCount)
+		for j := i; j < i+rowCount && j < len(gpus); j++ {
+			cards = append(cards, renderSingleGPU(gpus[j], rowCardWidth))
+		}
+		b.WriteString(joinColumns(cards))
 		b.WriteString("\n")
 	}
 
 	return b.String()
 }
 
-func renderSingleGPU(gpu internal.GPUInfo) string {
+func renderSingleGPU(gpu internal.GPUInfo, cardWidth int) string {
 	var b strings.Builder
+
+	cardWidth = clampInt(cardWidth, 52, 240)
+	barWidth := clampInt(cardWidth-4, 20, 220)
 
 	vramTotalGB := float64(gpu.VRAMTotal) / 1024.0
 	vramUsedGB := float64(gpu.VRAMUsed) / 1024.0
@@ -357,8 +516,6 @@ func renderSingleGPU(gpu internal.GPUInfo) string {
 		Foreground(tempColor).
 		Render(fmt.Sprintf("%d°C", gpu.Temperature))
 
-	const barWidth = 50
-
 	b.WriteString(fmt.Sprintf("  %s  %s  %s  %s\n", gpuIndex, gpuName, powerText, tempText))
 
 	vramLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("VRAM")
@@ -373,7 +530,7 @@ func renderSingleGPU(gpu internal.GPUInfo) string {
 	b.WriteString(renderProgressBar(float64(gpu.Utilization), barWidth, lipgloss.Color("208")))
 	b.WriteString("\n")
 
-	return b.String()
+	return lipgloss.NewStyle().Width(cardWidth).Render(b.String())
 }
 
 func renderRAMAndDiskSection(ram internal.RAMInfo, disks []internal.DiskInfo) string {
