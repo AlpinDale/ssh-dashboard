@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -9,10 +10,12 @@ import (
 )
 
 type SystemInfo struct {
-	CPU  CPUInfo
-	GPUs []GPUInfo
-	RAM  RAMInfo
-	Disk []DiskInfo
+	CPU              CPUInfo
+	GPUs             []GPUInfo
+	GPUDriverVersion string
+	CUDAVersion      string
+	RAM              RAMInfo
+	Disk             []DiskInfo
 }
 
 type CPUInfo struct {
@@ -30,6 +33,7 @@ type GPUInfo struct {
 	PowerDraw   int // in Watts
 	PowerLimit  int // in Watts
 	Temperature int // in Celsius
+	TempLimit   int // in Celsius
 }
 
 type RAMInfo struct {
@@ -56,8 +60,10 @@ func GatherSystemInfo(client *SSHClient) (*SystemInfo, error) {
 	}
 	info.CPU = cpuInfo
 
-	gpuInfo, _ := getGPUInfo(client)
+	gpuInfo, driverVersion, cudaVersion, _ := getGPUInfo(client)
 	info.GPUs = gpuInfo
+	info.GPUDriverVersion = driverVersion
+	info.CUDAVersion = cudaVersion
 
 	ramInfo, err := getRAMInfo(client)
 	if err != nil {
@@ -112,14 +118,28 @@ func getCPUInfo(client *SSHClient) (CPUInfo, error) {
 	return info, nil
 }
 
-func getGPUInfo(client *SSHClient) ([]GPUInfo, error) {
+func getGPUInfo(client *SSHClient) ([]GPUInfo, string, string, error) {
 	runCmd := func(cmd string) (string, error) {
 		return client.ExecuteCommand(cmd)
 	}
 
 	devices, err := gpu.QueryAll(runCmd)
 	if err != nil {
-		return []GPUInfo{}, nil
+		return []GPUInfo{}, "", "", nil
+	}
+
+	driverVersion := ""
+	cudaVersion := ""
+	if len(devices) > 0 {
+		driverVersion = devices[0].Driver
+		if devices[0].Vendor == "nvidia" {
+			if output, queryErr := runCmd("nvidia-smi"); queryErr == nil {
+				cudaPattern := regexp.MustCompile(`CUDA Version:\s*([0-9.]+)`)
+				if matches := cudaPattern.FindStringSubmatch(output); len(matches) == 2 {
+					cudaVersion = matches[1]
+				}
+			}
+		}
 	}
 
 	gpus := make([]GPUInfo, len(devices))
@@ -133,10 +153,11 @@ func getGPUInfo(client *SSHClient) ([]GPUInfo, error) {
 			PowerDraw:   dev.PowerDraw,
 			PowerLimit:  dev.PowerLimit,
 			Temperature: dev.Temperature,
+			TempLimit:   dev.TempLimit,
 		}
 	}
 
-	return gpus, nil
+	return gpus, driverVersion, cudaVersion, nil
 }
 
 func getRAMInfo(client *SSHClient) (RAMInfo, error) {
