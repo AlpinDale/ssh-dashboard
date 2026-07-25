@@ -884,6 +884,7 @@ func isAllowedCommand(cmd string) bool {
 	allowedPrefixes := []string{
 		"lscpu ",
 		"top -",
+		"cat /proc/stat",
 		"which ",
 		"nvidia-smi ",
 		"amd-smi ",
