@@ -10,6 +10,8 @@ type Device struct {
 	PowerDraw   int // watts
 	PowerLimit  int // watts
 	Temperature int // celsius
+	TempLimit   int // celsius (throttle/limit)
+	Driver      string
 	Vendor      string
 }
 

@@ -19,7 +19,10 @@ func (p NvidiaProvider) Detect(runCmd base.RunCmdFunc) bool {
 }
 
 func (p NvidiaProvider) Query(runCmd base.RunCmdFunc) ([]base.Device, error) {
-	output, err := runCmd("nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits")
+	output, err := runCmd("nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu,temperature.gpu.tlimit,driver_version --format=csv,noheader,nounits")
+	if err != nil {
+		output, err = runCmd("nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu,driver_version --format=csv,noheader,nounits")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -32,7 +35,7 @@ func (p NvidiaProvider) Query(runCmd base.RunCmdFunc) ([]base.Device, error) {
 		}
 
 		parts := strings.Split(line, ",")
-		if len(parts) >= 8 {
+		if len(parts) >= 9 {
 			device := base.Device{
 				Vendor: "nvidia",
 			}
@@ -59,6 +62,15 @@ func (p NvidiaProvider) Query(runCmd base.RunCmdFunc) ([]base.Device, error) {
 			}
 			if val, err := strconv.Atoi(strings.TrimSpace(parts[7])); err == nil {
 				device.Temperature = val
+			}
+
+			if len(parts) >= 10 {
+				if val, err := strconv.Atoi(strings.TrimSpace(parts[8])); err == nil {
+					device.TempLimit = val
+				}
+				device.Driver = strings.TrimSpace(parts[9])
+			} else {
+				device.Driver = strings.TrimSpace(parts[8])
 			}
 
 			devices = append(devices, device)
