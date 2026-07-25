@@ -26,6 +26,7 @@ type Model struct {
 	hosts          []internal.SSHHost
 	selectedHosts  []internal.SSHHost
 	currentHostIdx int
+	compactGPU     bool
 	list           list.Model
 	spinner        spinner.Model
 	clients        map[string]*internal.SSHClient
