@@ -92,6 +92,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 			}
+		case "m":
+			if m.screen == ScreenDashboard || m.screen == ScreenOverview {
+				m.compactGPU = !m.compactGPU
+			}
 		}
 
 	case tea.WindowSizeMsg:
