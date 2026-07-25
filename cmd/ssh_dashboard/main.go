@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/alpindale/ssh-dashboard/internal"
@@ -19,6 +18,51 @@ func validateInterval(seconds float64) time.Duration {
 		return 0
 	}
 	return time.Duration(seconds * float64(time.Second))
+}
+
+func buildModel(hosts []internal.SSHHost, requestedHosts []string, interval time.Duration) (ui.Model, error) {
+	if len(hosts) == 0 {
+		return ui.Model{}, fmt.Errorf("no hosts found in SSH config")
+	}
+
+	if len(requestedHosts) > 0 {
+		selectedHosts := make([]internal.SSHHost, 0, len(requestedHosts))
+		hostMap := make(map[string]internal.SSHHost)
+
+		for _, host := range hosts {
+			hostMap[host.Name] = host
+		}
+
+		for _, requestedName := range requestedHosts {
+			host, found := hostMap[requestedName]
+			if !found {
+				return ui.Model{}, fmt.Errorf("host '%s' not found in SSH config", requestedName)
+			}
+			selectedHosts = append(selectedHosts, host)
+		}
+
+		return ui.InitialModelWithHosts(hosts, selectedHosts, interval), nil
+	}
+
+	return ui.InitialModel(hosts, interval), nil
+}
+
+func runInteractiveSSH(host string) error {
+	sshPath, err := exec.LookPath("ssh")
+	if err != nil {
+		return fmt.Errorf("error finding ssh: %w", err)
+	}
+
+	cmd := exec.Command(sshPath, host)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("error executing ssh: %w", err)
+	}
+
+	return nil
 }
 
 func main() {
@@ -71,64 +115,43 @@ func main() {
 		}
 	}
 
-	hosts, err := internal.ParseSSHConfig("")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing SSH config: %v\n", err)
-		os.Exit(1)
-	}
-
-	if len(hosts) == 0 {
-		fmt.Fprintf(os.Stderr, "No hosts found in SSH config\n")
-		os.Exit(1)
-	}
-
-	var initialModel ui.Model
-
-	if len(requestedHosts) > 0 {
-		var selectedHosts []internal.SSHHost
-		hostMap := make(map[string]internal.SSHHost)
-
-		for _, host := range hosts {
-			hostMap[host.Name] = host
+	for {
+		hosts, err := internal.ParseSSHConfig("")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing SSH config: %v\n", err)
+			os.Exit(1)
 		}
 
-		for _, requestedName := range requestedHosts {
-			if host, found := hostMap[requestedName]; found {
-				selectedHosts = append(selectedHosts, host)
-			} else {
-				fmt.Fprintf(os.Stderr, "Host '%s' not found in SSH config\n", requestedName)
-				os.Exit(1)
-			}
+		model, err := buildModel(hosts, requestedHosts, interval)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
 		}
 
-		initialModel = ui.InitialModelWithHosts(hosts, selectedHosts, interval)
-	} else {
-		initialModel = ui.InitialModel(hosts, interval)
-	}
+		p := tea.NewProgram(model, tea.WithAltScreen())
+		finalModel, err := p.Run()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
+			os.Exit(1)
+		}
 
-	p := tea.NewProgram(initialModel, tea.WithAltScreen())
-	finalModel, err := p.Run()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
-		os.Exit(1)
-	}
+		m, ok := finalModel.(ui.Model)
+		if !ok {
+			return
+		}
 
-	if m, ok := finalModel.(ui.Model); ok {
-		if sshHost := m.GetSSHOnExit(); sshHost != "" {
-			sshPath, err := exec.LookPath("ssh")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error finding ssh: %v\n", err)
-				os.Exit(1)
-			}
+		sshHost := m.GetSSHOnExit()
+		if sshHost == "" {
+			return
+		}
 
-			args := []string{"ssh", sshHost}
-			env := os.Environ()
+		selectedHostNames := m.GetSelectedHostNames()
+		if len(selectedHostNames) > 0 {
+			requestedHosts = selectedHostNames
+		}
 
-			err = syscall.Exec(sshPath, args, env)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error executing ssh: %v\n", err)
-				os.Exit(1)
-			}
+		if err := runInteractiveSSH(sshHost); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 		}
 	}
 }

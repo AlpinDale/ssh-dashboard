@@ -190,6 +190,14 @@ func (m Model) GetSSHOnExit() string {
 	return m.sshOnExit
 }
 
+func (m Model) GetSelectedHostNames() []string {
+	names := make([]string, 0, len(m.selectedHosts))
+	for _, h := range m.selectedHosts {
+		names = append(names, h.Name)
+	}
+	return names
+}
+
 func (m *Model) updateListSelection() {
 	items := m.list.Items()
 	selectedMap := make(map[string]bool)
