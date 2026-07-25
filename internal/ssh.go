@@ -886,6 +886,7 @@ func isAllowedCommand(cmd string) bool {
 		"top -",
 		"cat /proc/stat",
 		"which ",
+		"nvidia-smi",
 		"nvidia-smi ",
 		"amd-smi ",
 		"rocm-smi ",
