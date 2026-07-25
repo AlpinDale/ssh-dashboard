@@ -130,6 +130,60 @@ func gpuGridDimensions(totalWidth, totalHeight, itemCount int) (int, int) {
 	return bestColumns, bestWidth
 }
 
+func parseSizeToGB(size string) float64 {
+	if size == "" {
+		return 0
+	}
+
+	unit := size[len(size)-1]
+	number := size
+	multiplier := 1.0
+
+	if unit < '0' || unit > '9' {
+		number = size[:len(size)-1]
+		switch unit {
+		case 'T', 't':
+			multiplier = 1024
+		case 'G', 'g':
+			multiplier = 1
+		case 'M', 'm':
+			multiplier = 1.0 / 1024.0
+		case 'K', 'k':
+			multiplier = 1.0 / (1024.0 * 1024.0)
+		default:
+			return 0
+		}
+	}
+
+	value, err := strconv.ParseFloat(number, 64)
+	if err != nil {
+		return 0
+	}
+
+	return value * multiplier
+}
+
+func isSignificantDisk(disk internal.DiskInfo) bool {
+	mount := strings.ToLower(strings.TrimSpace(disk.MountPoint))
+	if mount == "/" || mount == "/home" {
+		return true
+	}
+
+	ignoredMounts := []string{"/boot", "/boot/efi", "/efi", "[swap]"}
+	for _, ignored := range ignoredMounts {
+		if mount == ignored {
+			return false
+		}
+	}
+
+	sizeGB := parseSizeToGB(strings.TrimSpace(disk.Size))
+	if sizeGB > 0 && sizeGB < 4 {
+		return false
+	}
+
+	return true
+}
+
 func joinColumns(columns []string) string {
 	if len(columns) == 0 {
 		return ""
@@ -356,7 +410,7 @@ func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval 
 	b.WriteString(renderCPUSection(info.CPU))
 	b.WriteString("\n")
 
-	b.WriteString(renderRAMAndDiskSection(info.RAM, info.Disk))
+	b.WriteString(renderRAMAndDiskSection(info.RAM, info.Disk, width))
 
 	if len(info.GPUs) > 1 {
 		b.WriteString("\n")
@@ -533,15 +587,26 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int) string {
 	return lipgloss.NewStyle().Width(cardWidth).Render(b.String())
 }
 
-func renderRAMAndDiskSection(ram internal.RAMInfo, disks []internal.DiskInfo) string {
-	ramSection := renderRAMSection(ram)
-	diskSection := renderDiskSection(disks)
+func renderRAMAndDiskSection(ram internal.RAMInfo, disks []internal.DiskInfo, totalWidth int) string {
+	contentWidth := effectiveWidth(totalWidth) - 2
+
+	if contentWidth < 96 {
+		diskSection := renderDiskSection(disks, contentWidth)
+		ramSection := renderRAMSection(ram, contentWidth)
+		return diskSection + "\n" + ramSection + "\n"
+	}
+
+	sectionWidth := (contentWidth - 4) / 2
+	diskSection := renderDiskSection(disks, sectionWidth)
+	ramSection := renderRAMSection(ram, sectionWidth)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, diskSection, "    ", ramSection) + "\n"
 }
 
-func renderRAMSection(ram internal.RAMInfo) string {
+func renderRAMSection(ram internal.RAMInfo, sectionWidth int) string {
 	var b strings.Builder
+	sectionWidth = clampInt(sectionWidth, 40, 240)
+	barWidth := clampInt(sectionWidth-4, 20, 220)
 
 	b.WriteString(headerStyle.Render("● RAM Information"))
 	b.WriteString("\n")
@@ -551,19 +616,34 @@ func renderRAMSection(ram internal.RAMInfo) string {
 
 	b.WriteString(fmt.Sprintf("  %.1f GB / %.1f GB (%.1f%%)\n", usedGB, totalGB, ram.UsagePercent))
 	b.WriteString("  ")
-	b.WriteString(renderProgressBar(ram.UsagePercent, 50, lipgloss.Color("10")))
+	b.WriteString(renderProgressBar(ram.UsagePercent, barWidth, lipgloss.Color("10")))
 	b.WriteString("\n")
 
-	return b.String()
+	return lipgloss.NewStyle().Width(sectionWidth).Render(b.String())
 }
 
-func renderDiskSection(disks []internal.DiskInfo) string {
+func renderDiskSection(disks []internal.DiskInfo, sectionWidth int) string {
 	var b strings.Builder
+	sectionWidth = clampInt(sectionWidth, 40, 240)
+	barWidth := clampInt(sectionWidth-4, 20, 220)
 
 	b.WriteString(headerStyle.Render("● Disk Usage"))
 	b.WriteString("\n")
 
+	filteredDisks := make([]internal.DiskInfo, 0, len(disks))
 	for _, disk := range disks {
+		if isSignificantDisk(disk) {
+			filteredDisks = append(filteredDisks, disk)
+		}
+	}
+
+	if len(filteredDisks) == 0 {
+		b.WriteString("  No significant partitions\n")
+		b.WriteString("  " + strings.Repeat(" ", barWidth) + "\n")
+		return lipgloss.NewStyle().Width(sectionWidth).Render(b.String())
+	}
+
+	for i, disk := range filteredDisks {
 		usageStr := strings.TrimSuffix(disk.UsagePercent, "%")
 		usagePercent := 0.0
 		if val, err := strconv.ParseFloat(usageStr, 64); err == nil {
@@ -584,9 +664,12 @@ func renderDiskSection(disks []internal.DiskInfo) string {
 			barColor = lipgloss.Color("10") // Green
 		}
 
-		b.WriteString(renderProgressBar(usagePercent, 50, barColor))
-		b.WriteString("\n\n")
+		b.WriteString(renderProgressBar(usagePercent, barWidth, barColor))
+		b.WriteString("\n")
+		if i < len(filteredDisks)-1 {
+			b.WriteString("\n")
+		}
 	}
 
-	return b.String()
+	return lipgloss.NewStyle().Width(sectionWidth).Render(b.String())
 }
