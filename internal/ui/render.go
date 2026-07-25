@@ -522,7 +522,7 @@ func renderDashboard(hostName string, info *internal.SystemInfo, updateInterval 
 
 	if len(info.GPUs) > 0 {
 		b.WriteString("\n")
-		b.WriteString(renderGPUSection(info.GPUs, width, height))
+		b.WriteString(renderGPUSection(info.GPUs, info.GPUDriverVersion, info.CUDAVersion, width, height))
 	}
 
 	return fillToHeight(b.String(), height)
@@ -586,7 +586,7 @@ func renderAggregateGPUSection(gpus []internal.GPUInfo, totalWidth, totalHeight 
 	totalVRAMGB := float64(totalVRAM) / 1024.0
 	usedVRAMGB := float64(usedVRAM) / 1024.0
 
-	b.WriteString(headerStyle.Render("● Total GPU Pressure"))
+	b.WriteString(headerStyle.Render("● Total GPU Usage"))
 	b.WriteString("\n\n")
 
 	contentWidth := effectiveWidth(totalWidth) - 2
@@ -609,11 +609,33 @@ func renderAggregateGPUSection(gpus []internal.GPUInfo, totalWidth, totalHeight 
 	return b.String()
 }
 
-func renderGPUSection(gpus []internal.GPUInfo, totalWidth, totalHeight int) string {
+func renderGPUSection(gpus []internal.GPUInfo, driverVersion, cudaVersion string, totalWidth, totalHeight int) string {
 	var b strings.Builder
 
 	b.WriteString(headerStyle.Render("● GPU Information"))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+
+	metaLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	metaValueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+	rightParts := make([]string, 0, 2)
+	if driverVersion != "" {
+		rightParts = append(rightParts, metaLabelStyle.Render("Driver:")+" "+metaValueStyle.Render(driverVersion))
+	}
+	if cudaVersion != "" {
+		rightParts = append(rightParts, metaLabelStyle.Render("CUDA:")+" "+metaValueStyle.Render(cudaVersion))
+	}
+	if len(rightParts) > 0 {
+		separator := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(" | ")
+		rightText := strings.Join(rightParts, separator)
+		availableSpace := effectiveWidth(totalWidth) - lipgloss.Width(rightText)
+		if availableSpace > 0 {
+			b.WriteString(strings.Repeat(" ", availableSpace))
+		}
+		b.WriteString(rightText)
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString("\n")
+	}
 
 	contentWidth := effectiveWidth(totalWidth) - 2
 	columns, cardWidth := gpuGridDimensions(contentWidth, totalHeight, len(gpus))
@@ -675,25 +697,19 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int) string {
 	} else {
 		powerColor = lipgloss.Color("196") // Red
 	}
-	powerText := lipgloss.NewStyle().
-		Foreground(powerColor).
-		Render(fmt.Sprintf("%dW", gpu.PowerDraw))
 
 	var tempColor lipgloss.Color
-	if gpu.Temperature < 70 {
-		tempColor = lipgloss.Color("10") // Green
-	} else if gpu.Temperature < 80 {
-		tempColor = lipgloss.Color("11") // Yellow
+	if gpu.Temperature < 65 {
+		tempColor = lipgloss.Color("141") // Purple
+	} else if gpu.Temperature < 75 {
+		tempColor = lipgloss.Color("177") // Light purple
 	} else if gpu.Temperature < 85 {
-		tempColor = lipgloss.Color("208") // Orange
+		tempColor = lipgloss.Color("204") // Pink
 	} else {
 		tempColor = lipgloss.Color("196") // Red
 	}
-	tempText := lipgloss.NewStyle().
-		Foreground(tempColor).
-		Render(fmt.Sprintf("%d°C", gpu.Temperature))
 
-	b.WriteString(fmt.Sprintf("  %s  %s  %s  %s\n", gpuIndex, gpuName, powerText, tempText))
+	b.WriteString(fmt.Sprintf("  %s  %s\n", gpuIndex, gpuName))
 
 	vramLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("VRAM")
 	b.WriteString(fmt.Sprintf("  %s %.1f/%.1f GB (%.1f%%)\n", vramLabel, vramUsedGB, vramTotalGB, vramPercent))
@@ -701,10 +717,37 @@ func renderSingleGPU(gpu internal.GPUInfo, cardWidth int) string {
 	b.WriteString(renderProgressBar(vramPercent, barWidth, lipgloss.Color("39")))
 	b.WriteString("\n")
 
-	utilLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render("Util")
+	utilLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Render("Utilization")
 	b.WriteString(fmt.Sprintf("  %s %d%%\n", utilLabel, gpu.Utilization))
 	b.WriteString("  ")
 	b.WriteString(renderProgressBar(float64(gpu.Utilization), barWidth, lipgloss.Color("208")))
+	b.WriteString("\n")
+
+	powerLabel := lipgloss.NewStyle().Foreground(powerColor).Render("Power Draw")
+	if gpu.PowerLimit > 0 {
+		b.WriteString(fmt.Sprintf("  %s %d/%dW (%.1f%%)\n", powerLabel, gpu.PowerDraw, gpu.PowerLimit, powerPercent))
+		b.WriteString("  ")
+		b.WriteString(renderProgressBar(powerPercent, barWidth, powerColor))
+		b.WriteString("\n")
+	} else {
+		b.WriteString(fmt.Sprintf("  %s %dW (limit N/A)\n", powerLabel, gpu.PowerDraw))
+		b.WriteString("  ")
+		b.WriteString(renderProgressBar(0, barWidth, powerColor))
+		b.WriteString("\n")
+	}
+
+	tempLimit := gpu.TempLimit
+	if tempLimit <= 0 {
+		tempLimit = 83
+	}
+	tempPercent := (float64(gpu.Temperature) / float64(tempLimit)) * 100
+	if tempPercent > 100 {
+		tempPercent = 100
+	}
+	tempLabel := lipgloss.NewStyle().Foreground(tempColor).Render("Temperature")
+	b.WriteString(fmt.Sprintf("  %s %d/%d°C (%.1f%%)\n", tempLabel, gpu.Temperature, tempLimit, tempPercent))
+	b.WriteString("  ")
+	b.WriteString(renderProgressBar(tempPercent, barWidth, tempColor))
 	b.WriteString("\n")
 
 	return lipgloss.NewStyle().Width(cardWidth).Render(b.String())
