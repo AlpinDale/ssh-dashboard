@@ -885,6 +885,7 @@ func isAllowedCommand(cmd string) bool {
 		"lscpu ",
 		"top -",
 		"which ",
+		"nvidia-smi",
 		"nvidia-smi ",
 		"amd-smi ",
 		"rocm-smi ",
