@@ -885,6 +885,7 @@ func isAllowedCommand(cmd string) bool {
 		"lscpu ",
 		"top -",
 		"cat /proc/stat",
+		"hostname -I",
 		"which ",
 		"nvidia-smi",
 		"nvidia-smi ",
