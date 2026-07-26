@@ -80,8 +80,9 @@ The tool will:
 - Press `Enter` to connect and view the dashboard
 - While in the dashboard, press `c` to return to host selection to add/remove hosts
 - Press `n` to cycle through connected hosts (like tmux sessions)
-- Press `t` to toggle overview mode, showing all selected hosts at once with GPU pressure summaries
-- Press `s` to exit the dashboard and drop into an interactive SSH shell with the current host
+- Press `t` to toggle overview mode, showing all selected hosts at once with GPU usage summaries
+- Press `m` to toggle compact GPU card mode, useful on high GPU-count hosts
+- Press `s` to drop into an interactive SSH shell with the current host; exiting the shell returns you to the dashboard with the same hosts selected
 - All connections remain active - no need to reconnect!
 
 ### Configuration
@@ -118,8 +119,17 @@ ssh-dashboard
 - `Enter` - Connect to selected host(s)
 - `n` - Switch to next host (when multiple hosts selected)
 - `t` - Toggle overview screen (shows all hosts at once)
-- `s` - Exit and SSH into current host
+- `m` - Toggle compact GPU card mode
+- `s` - SSH into current host; returns to the dashboard when the shell exits
 - `c` - Add hosts (from dashboard, returns to host selection)
+
+**GPU Thermal Bar Behavior:**
+
+Temperature bars use non-linear visual scaling to better highlight thermal risk: from 0-75% of a GPU's thermal limit, the bar fills slowly (0-20% visual fill); from 75-100%, it ramps quickly (20-100% visual fill). This keeps normal operating temperatures from looking alarming while making genuine heat spikes obvious at a glance.
+
+**GPU PCIe Link Indicator:**
+
+Each GPU card includes a right-aligned PCIe link readout when the remote reports it, e.g. `PCIe: Gen4 @ 16x`. It's color-coded from red to bright green based on link quality (generation weighted slightly higher than lane width), so a GPU running at a degraded link - fewer lanes or an older generation than expected - stands out immediately.
 
 ## SSH Configuration
 
@@ -164,14 +174,15 @@ ssh-add -l
 ## Remote Requirements
 
 The remote hosts should have these commands available:
-- `lscpu` - CPU information
+- `lscpu` - CPU information, and per-core/per-socket topology for the per-core usage meters
 - `top` - CPU usage
 - `free` - RAM information
 - `df` - Disk usage
 - `nvidia-smi` - GPU information (NVIDIA GPUs only)
 - `amd-smi` or `rocm-smi` - GPU information (AMD GPUs only)
+- `hostname` - primary IP address shown on the overview screen (optional; falls back to "N/A" if unavailable)
 
-Most Linux distributions include these by default.
+Most Linux distributions include these by default. Per-core CPU usage is read directly from `/proc/stat`, available on any Linux host regardless of installed packages.
 
 ## Development
 
