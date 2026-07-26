@@ -9,10 +9,11 @@ import (
 )
 
 type SystemInfo struct {
-	CPU  CPUInfo
-	GPUs []GPUInfo
-	RAM  RAMInfo
-	Disk []DiskInfo
+	CPU       CPUInfo
+	GPUs      []GPUInfo
+	PrimaryIP string
+	RAM       RAMInfo
+	Disk      []DiskInfo
 }
 
 type CPUInfo struct {
@@ -58,6 +59,7 @@ func GatherSystemInfo(client *SSHClient) (*SystemInfo, error) {
 
 	gpuInfo, _ := getGPUInfo(client)
 	info.GPUs = gpuInfo
+	info.PrimaryIP = getPrimaryIP(client)
 
 	ramInfo, err := getRAMInfo(client)
 	if err != nil {
@@ -137,6 +139,18 @@ func getGPUInfo(client *SSHClient) ([]GPUInfo, error) {
 	}
 
 	return gpus, nil
+}
+
+func getPrimaryIP(client *SSHClient) string {
+	output, err := client.ExecuteCommand("hostname -I")
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
 func getRAMInfo(client *SSHClient) (RAMInfo, error) {

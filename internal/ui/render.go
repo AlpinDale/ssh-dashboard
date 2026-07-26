@@ -275,6 +275,13 @@ func (m Model) renderSingleHostOverview(host internal.SSHHost, sectionWidth int)
 	b.WriteString(headerStyle.Render(fmt.Sprintf("● %s", host.Name)))
 	b.WriteString("\n")
 
+	primaryIP := sysInfo.PrimaryIP
+	if primaryIP == "" {
+		primaryIP = "N/A"
+	}
+	b.WriteString(fmt.Sprintf("  IP: %s", primaryIP))
+	b.WriteString("\n")
+
 	cpuUsage := sysInfo.CPU.Usage
 	if cpuUsage == "" {
 		cpuUsage = "N/A"
@@ -303,10 +310,13 @@ func (m Model) renderSingleHostOverview(host internal.SSHHost, sectionWidth int)
 	if len(sysInfo.GPUs) > 0 {
 		var totalVRAM, usedVRAM int
 		var totalUtil int
+		var totalPowerDraw, totalPowerLimit int
 		for _, gpu := range sysInfo.GPUs {
 			totalVRAM += gpu.VRAMTotal
 			usedVRAM += gpu.VRAMUsed
 			totalUtil += gpu.Utilization
+			totalPowerDraw += gpu.PowerDraw
+			totalPowerLimit += gpu.PowerLimit
 		}
 
 		vramPercent := 0.0
@@ -322,13 +332,35 @@ func (m Model) renderSingleHostOverview(host internal.SSHHost, sectionWidth int)
 		vramBar := renderProgressBar(vramPercent, barWidth, lipgloss.Color("33"))
 		utilBar := renderProgressBar(float64(avgUtil), barWidth, lipgloss.Color("208"))
 
+		powerPercent := 0.0
+		if totalPowerLimit > 0 {
+			powerPercent = (float64(totalPowerDraw) / float64(totalPowerLimit)) * 100
+		}
+		var powerColor lipgloss.Color
+		if powerPercent < 70 {
+			powerColor = lipgloss.Color("10")
+		} else if powerPercent < 90 {
+			powerColor = lipgloss.Color("11")
+		} else {
+			powerColor = lipgloss.Color("196")
+		}
+		powerBar := renderProgressBar(powerPercent, barWidth, powerColor)
+
 		b.WriteString(fmt.Sprintf("  GPU VRAM: %.1f / %.1f GB (%.0f%%)\n", float64(usedVRAM)/1024, float64(totalVRAM)/1024, vramPercent))
 		b.WriteString("  " + vramBar + "\n")
 		b.WriteString(fmt.Sprintf("  GPU Util: %d%% avg\n", avgUtil))
 		b.WriteString("  " + utilBar + "\n")
+		if totalPowerLimit > 0 {
+			b.WriteString(fmt.Sprintf("  GPU Power: %d/%dW (%.0f%%)\n", totalPowerDraw, totalPowerLimit, powerPercent))
+		} else {
+			b.WriteString(fmt.Sprintf("  GPU Power: %dW\n", totalPowerDraw))
+		}
+		b.WriteString("  " + powerBar + "\n")
 	} else {
 		paddingLine := strings.Repeat(" ", barWidth)
 		b.WriteString("  GPU: N/A\n")
+		b.WriteString(paddingLine + "\n")
+		b.WriteString(paddingLine + "\n")
 		b.WriteString(paddingLine + "\n")
 		b.WriteString(paddingLine + "\n")
 		b.WriteString(paddingLine + "\n")
