@@ -15,6 +15,7 @@ type SystemInfo struct {
 	GPUs             []GPUInfo
 	GPUDriverVersion string
 	CUDAVersion      string
+	PrimaryIP        string
 	RAM              RAMInfo
 	Disk             []DiskInfo
 }
@@ -85,6 +86,7 @@ func GatherSystemInfo(client *SSHClient) (*SystemInfo, error) {
 	info.GPUs = gpuInfo
 	info.GPUDriverVersion = driverVersion
 	info.CUDAVersion = cudaVersion
+	info.PrimaryIP = getPrimaryIP(client)
 
 	ramInfo, err := getRAMInfo(client)
 	if err != nil {
@@ -369,6 +371,18 @@ func getGPUInfo(client *SSHClient) ([]GPUInfo, string, string, error) {
 	}
 
 	return gpus, driverVersion, cudaVersion, nil
+}
+
+func getPrimaryIP(client *SSHClient) string {
+	output, err := client.ExecuteCommand("hostname -I")
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
 func getRAMInfo(client *SSHClient) (RAMInfo, error) {
